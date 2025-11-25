@@ -1,79 +1,57 @@
-import boto3
-import mysql.connector
-from datetime import datetime, timedelta
-from tabulate import tabulate
+#!/usr/bin/env python3
 
-# --- Date Setup ---
-AWS_REGION = "us-east-1"
-MYSQL_HOST = "127.0.0.1"
-MYSQL_PORT = 3306
-MYSQL_USER = "root"
-MYSQL_PASSWORD = "rootpass"
-MYSQL_DB = "finopsdb"
+if len(keys) > 3:
+    # tag key will be something like 'user:Environment' depending on how CE returns it
+    tag_value = keys[3]
+    tag_key = 'Environment'  # the caller controlled which tag_key was used; this script uses tag per fetch
 
+metrics = group.get('Metrics', {})
+unblended = float(metrics.get('UnblendedCost', {}).get('Amount', 0.0)) if metrics.get('UnblendedCost') else None
+amortized = float(metrics.get('AmortizedCost', {}).get('Amount', 0.0)) if metrics.get('AmortizedCost') else None
+usage_qty = float(metrics.get('UsageQuantity', {}).get('Amount', 0.0)) if metrics.get('UsageQuantity') else None
 
-def create_table_if_not_exists(cursor):
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS aws_cost_usage (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            start_date DATE,
-            end_date DATE,
-            service VARCHAR(255),
-            amount DECIMAL(10, 2),
-            unit VARCHAR(50),
-            retrieved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+unit = None
+if metrics.get('UnblendedCost'):
+    unit = metrics['UnblendedCost'].get('Unit')
 
+batch.append(
+    (start, end, service, usage_type, linked_account,
+     tag_key, tag_value, unblended, amortized, usage_qty, unit)
+)
 
-def fetch_cost_data(start_date, end_date):
-    client = boto3.client('ce', region_name=AWS_REGION)
-    response = client.get_cost_and_usage(
-        TimePeriod={'Start': start_date, 'End': end_date},
-        Granularity='DAILY',
-        Metrics=['UnblendedCost'],
-        GroupBy=[{'Type': 'DIMENSION', 'Key': 'SERVICE'}]
-    )
-    return response['ResultsByTime']
+if len(batch) >= 500:
+    cur.executemany(insert_sql, batch)
+    conn.commit()
+    batch = []
+
+if batch:
+    cur.executemany(insert_sql, batch)
+    conn.commit()
+
+cur.close()
+conn.close()
 
 
-def store_cost_data(data):
-    connection = mysql.connector.connect(
-        host="127.0.0.1",
-        user="root",
-        password="Strongpass",
-        database="finopsdb",
-        port=3306
-    )
-    cursor = connection.cursor()
-    create_table_if_not_exists(cursor)
+def run_ingest(days=7):
+    end_date = datetime.utcnow().date()
+    start_date = end_date - timedelta(days=days)
 
-    for day in data:
-        start = day['TimePeriod']['Start']
-        end = day['TimePeriod']['End']
-        for group in day['Groups']:
-            service = group['Keys'][0]
-            amount = float(group['Metrics']['UnblendedCost']['Amount'])
-            unit = group['Metrics']['UnblendedCost']['Unit']
+    logger.info('Fetching cost data from %s to %s', start_date, end_date)
 
-            cursor.execute("""
-                INSERT INTO aws_cost_usage (start_date, end_date, service, amount)
-                VALUES (%s, %s, %s, %s)
-            """, (start, end, service, amount))
-
-    connection.commit()
-    cursor.close()
-    connection.close()
-
-
-if __name__ == "__main__":
-    end_date = datetime.today().date()
-    start_date = end_date - timedelta(days=7)
-
-    print(f"Fetching AWS cost data from {start_date} to {end_date}...")
-    data = fetch_cost_data(str(start_date), str(end_date))
-
-    print("Storing results in MySQL...")
+    # Fetch without tags first (tag_key=None) to get base groups
+    data = fetch_cost_data(str(start_date), str(end_date), tag_key=None)
     store_cost_data(data)
 
-    print("✅ Done! Cost data stored successfully.")
+    # Fetch per-tag so we can capture tag breakdowns
+    for tag_key in TAG_KEYS:
+        logger.info('Fetching cost data for tag: %s', tag_key)
+        data = fetch_cost_data(str(start_date), str(end_date), tag_key=tag_key)
+        store_cost_data(data)
+
+    logger.info('Ingest complete')
+
+
+if __name__ == '__main__':
+    # Optional CLI days parameter via env
+    days = int(os.getenv('INGEST_DAYS', '7'))
+    run_ingest(days=days)
